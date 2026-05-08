@@ -1,360 +1,325 @@
-// ============================================
-// LEADFLOW SERVER
-// This is the main file that runs everything.
-// It:
-// 1. Listens for new lead emails from Make.com
-// 2. Parses the lead details
-// 3. Generates an AI reply
-// 4. Sends the reply via Thumbtack browser automation
-//    OR via email thread (fallback)
-// 5. Notifies the business owner by SMS
-// 6. Logs everything to Airtable
-// ============================================
+// server.js — LeadFlow main server
+// All files are at root level for Railway compatibility
+require('dotenv').config();
 
 const express = require('express');
 const cron = require('node-cron');
-require('dotenv').config();
 
-// Import all our modules
-const { parseLeadEmail } = require('./email-parser');
-const { generateFirstReply, generateFollowUp, scoreLead } = require('./ai');
-const { sendThumbtackReply, testThumbtackLogin } = require('./thumbtack');
-const { sendEmailReply } = require('./email-sender');
-const { notifyOwner, sendOwnerDraftReply } = require('./twilio');
-const {
-  getClientByEmail,
-  getClientByName,
-  saveLead,
-  updateLeadStatus,
-  getLeadsNeedingFollowUp
-} = require('./airtable');
+const { generateFirstReply, generateFollowUp } = require('./ai');
+const { getClientById, getClientByName, saveLead, updateLead, saveClientTokens, getLeadsNeedingFollowUp } = require('./airtable');
+const { getConnectUrl, exchangeCodeForTokens, getBusinesses, createWebhook, sendMessage, getLeadDetails } = require('./thumbtack');
+const { notifyOwner, textLead } = require('./sms');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Parse incoming JSON and text data
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ============================================
-// HEALTH CHECK ENDPOINT
-// Visit yourdomain.com/health to confirm
-// the server is running
-// ============================================
+const PORT = process.env.PORT || 3000;
+const APP_URL = process.env.APP_URL || `http://localhost:${PORT}`;
+
+// Simple page styling for onboarding screens
+const css = `<style>
+  body{font-family:-apple-system,sans-serif;max-width:520px;margin:80px auto;padding:24px}
+  h1{font-size:24px;margin-bottom:8px}
+  p{color:#555;line-height:1.6}
+  .btn{display:inline-block;background:#009fd4;color:#fff;padding:14px 28px;border-radius:8px;text-decoration:none;font-size:16px;margin-top:20px}
+  .ok{color:#16a34a;font-weight:500}
+  .err{color:#dc2626}
+  .step{display:flex;gap:12px;margin-bottom:14px;align-items:flex-start}
+  .num{background:#009fd4;color:#fff;border-radius:50%;width:24px;height:24px;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;margin-top:2px}
+</style>`;
+
+// ─────────────────────────────────────────────
+// HEALTH CHECK
+// Visit /health to confirm the server is running
+// ─────────────────────────────────────────────
 app.get('/health', (req, res) => {
-  res.json({
-    status: 'LeadFlow is running ✅',
-    time: new Date().toISOString(),
-    version: '1.0.0'
-  });
+  res.json({ status: 'LeadFlow is running ✅', time: new Date().toISOString() });
 });
 
-// ============================================
-// MAIN WEBHOOK — NEW LEAD RECEIVED
-// Make.com calls this URL every time a new
-// lead email arrives in your client's inbox.
-//
-// Make.com sends the email data as JSON:
-// {
-//   "secret": "your-webhook-secret",
-//   "clientName": "Tampa Plumbing Co.",
-//   "email": {
-//     "from": "noreply@thumbtack.com",
-//     "replyTo": "reply-12345@mail.thumbtack.com",
-//     "subject": "New lead: Local Moving",
-//     "text": "Nicole W. wants Local Moving...",
-//     "messageId": "<abc123@thumbtack.com>"
-//   }
-// }
-// ============================================
-app.post('/webhook/new-lead', async (req, res) => {
-  console.log('\n========================================');
-  console.log('[Server] 📬 New lead webhook received!');
-  console.log('========================================');
+app.get('/', (req, res) => {
+  res.send(`${css}<h1>🚀 LeadFlow</h1><p>AI lead automation for local service businesses.</p><p><a href="/health">Health check</a></p>`);
+});
 
-  // Verify the request is really from Make.com
-  // using the secret key you set in your .env file
-  const secret = req.headers['x-webhook-secret'] || req.body.secret;
-  if (secret !== process.env.WEBHOOK_SECRET) {
-    console.log('[Server] ❌ Invalid webhook secret — rejecting request');
-    return res.status(401).json({ error: 'Unauthorized' });
+// ─────────────────────────────────────────────
+// ONBOARDING PAGE
+// Send clients to: /onboard/THEIR_AIRTABLE_ID
+// They click "Connect Thumbtack" and it starts OAuth
+// ─────────────────────────────────────────────
+app.get('/onboard/:clientId', async (req, res) => {
+  const { clientId } = req.params;
+  const client = await getClientById(clientId).catch(() => null);
+  const name = client?.businessName || 'your business';
+
+  res.send(`${css}
+    <h1>Connect ${name} to LeadFlow</h1>
+    <p>One click and every new Thumbtack lead gets an instant AI reply automatically.</p>
+    <div style="margin:28px 0">
+      <div class="step"><div class="num">1</div><div>Click below and log into your Thumbtack account</div></div>
+      <div class="step"><div class="num">2</div><div>Click "Allow" to give LeadFlow permission</div></div>
+      <div class="step"><div class="num">3</div><div>Done — leads get instant AI replies from now on</div></div>
+    </div>
+    <a href="/connect/thumbtack?client=${clientId}" class="btn">Connect Thumbtack Account →</a>
+    <p style="font-size:13px;color:#999;margin-top:20px">We only send messages on your behalf. We never change your profile, billing, or settings.</p>
+  `);
+});
+
+// ─────────────────────────────────────────────
+// OAUTH STEP 1 — Redirect to Thumbtack login
+// ─────────────────────────────────────────────
+app.get('/connect/thumbtack', (req, res) => {
+  const { client } = req.query;
+  if (!client) return res.status(400).send(`${css}<h1>Missing client ID</h1><p class="err">Use the link from your onboarding email.</p>`);
+  const url = getConnectUrl(client);
+  res.redirect(url);
+});
+
+// ─────────────────────────────────────────────
+// OAUTH STEP 2 — Thumbtack redirects back here
+// Exchange the code for tokens, set up webhooks
+// ─────────────────────────────────────────────
+app.get('/auth/thumbtack/callback', async (req, res) => {
+  const { code, state: clientId, error } = req.query;
+
+  if (error) {
+    return res.send(`${css}<h1>Connection cancelled</h1>
+      <p>You cancelled the Thumbtack connection. <a href="/connect/thumbtack?client=${clientId}">Try again</a>.</p>`);
   }
 
-  // Tell Make.com we received it immediately
-  // (Make.com will timeout if we don't respond within 40 seconds)
-  res.json({ received: true, message: 'Processing lead...' });
+  try {
+    // Get tokens from Thumbtack
+    const tokens = await exchangeCodeForTokens(code);
 
-  // Now process the lead asynchronously
-  // (this runs in the background after we've already responded)
-  processNewLead(req.body).catch(error => {
-    console.error('[Server] Error processing lead:', error);
-  });
+    // Load client from Airtable
+    const client = await getClientById(clientId);
+    if (!client) throw new Error('Client not found in database');
+
+    // Save tokens to Airtable
+    await saveClientTokens(clientId, tokens);
+
+    // Get their Thumbtack businesses and create webhooks
+    const clientWithTokens = { ...client, ...tokens, thumbtackTokenExpiresAt: tokens.expiresAt };
+    const businesses = await getBusinesses(clientWithTokens);
+
+    let webhookCount = 0;
+    for (const biz of businesses) {
+      try {
+        await createWebhook(clientWithTokens, biz.businessId || biz.id);
+        webhookCount++;
+      } catch (e) {
+        console.error('[Server] Webhook creation failed:', e.message);
+      }
+    }
+
+    // Text the owner to confirm they're connected
+    if (client.ownerPhone) {
+      await textLead(client.ownerPhone,
+        `✅ LeadFlow connected! ${client.businessName} is now live on Thumbtack. Every new lead gets an instant AI reply. We'll text you when they come in.`,
+        client.quoPhoneId
+      );
+    }
+
+    res.send(`${css}
+      <h1>🎉 You're connected!</h1>
+      <p class="ok">${client.businessName} is now live on LeadFlow.</p>
+      <p>Every new Thumbtack lead will get an instant personalized reply automatically. We connected ${webhookCount} business listing${webhookCount !== 1 ? 's' : ''}.</p>
+      <p style="color:#999;font-size:13px;margin-top:24px">You can close this window. We'll text you when leads come in.</p>`);
+
+  } catch (err) {
+    console.error('[Server] OAuth callback error:', err.message);
+    res.send(`${css}<h1>Something went wrong</h1>
+      <p class="err">${err.message}</p>
+      <p><a href="/connect/thumbtack?client=${clientId}">Try again</a> or reply to your onboarding email for help.</p>`);
+  }
 });
 
-// ============================================
-// THE CORE LEAD PROCESSING FUNCTION
-// This is where all the magic happens
-// ============================================
-async function processNewLead(webhookData) {
-  try {
-    const { clientName, email } = webhookData;
+// ─────────────────────────────────────────────
+// THUMBTACK WEBHOOK
+// Thumbtack calls this when a new lead arrives
+// URL is unique per client: /webhook/thumbtack/CLIENT_ID
+// ─────────────────────────────────────────────
+app.post('/webhook/thumbtack/:clientId', async (req, res) => {
+  const { clientId } = req.params;
+  const data = req.body;
 
-    if (!email) {
-      console.log('[Server] No email data in webhook — skipping');
-      return;
-    }
+  console.log(`\n[Webhook] Event: ${data.eventType} | Client: ${clientId}`);
 
-    // ---- STEP 1: PARSE THE EMAIL ----
-    console.log('[Server] Step 1: Parsing email...');
-    const lead = parseLeadEmail(email);
-    console.log(`[Server] Lead: ${lead.leadName}, Service: ${lead.serviceType}, Source: ${lead.source}`);
+  // Always respond immediately — Thumbtack retries if no response within 5s
+  res.json({ received: true });
 
-    // ---- STEP 2: GET THE CLIENT'S INFO FROM AIRTABLE ----
-    console.log('[Server] Step 2: Looking up client...');
-    let client = null;
+  // Process in background
+  handleWebhook(clientId, data).catch(err => console.error('[Webhook] Error:', err.message));
+});
 
-    if (clientName) {
-      // Make.com sends the client name with each webhook
-      client = await getClientByName(clientName);
-    }
+async function handleWebhook(clientId, data) {
+  // ── NEW LEAD ──────────────────────────────
+  if (data.eventType === 'lead.created') {
+    const client = await getClientById(clientId);
+    if (!client || !client.isActive) return;
 
-    if (!client) {
-      console.log('[Server] ❌ Client not found — cannot process lead');
-      return;
-    }
+    // Get full lead details from Thumbtack API
+    const negotiationId = data.negotiationId || data.lead?.negotiationId;
+    if (!negotiationId) return console.log('[Webhook] No negotiation ID');
 
-    if (!client.isActive) {
-      console.log(`[Server] Client ${client.businessName} is inactive — skipping`);
-      return;
-    }
+    const details = await getLeadDetails(client, negotiationId);
+    if (!details) return;
 
-    console.log(`[Server] Found client: ${client.businessName}`);
+    // Build lead object
+    const lead = {
+      source: 'thumbtack',
+      leadName: details.customerName || 'Customer',
+      serviceType: details.category || details.serviceName || '',
+      location: details.location ? `${details.location.city || ''}, ${details.location.state || ''}`.trim().replace(/^,|,$/, '') : '',
+      dates: details.requestedDate || '',
+      jobDetails: details.details || {},
+      message: details.customerMessage || '',
+      negotiationId,
+      phone: details.customerPhone || ''
+    };
 
-    // ---- STEP 3: SCORE THE LEAD ----
-    console.log('[Server] Step 3: Scoring lead quality...');
-    const leadScore = await scoreLead(lead, client);
-    console.log(`[Server] Lead score: ${leadScore}/10`);
+    console.log(`[Lead] ${lead.leadName} — ${lead.serviceType} — ${lead.location}`);
 
-    // ---- STEP 4: GENERATE AI REPLY ----
-    console.log('[Server] Step 4: Generating AI reply...');
+    // Generate AI reply
     const aiReply = await generateFirstReply(lead, client);
-    console.log(`[Server] AI reply generated (${aiReply.length} chars)`);
 
-    // ---- STEP 5: SEND THE REPLY ----
-    // We try three methods in order of preference:
-    // Method A: Browser automation (fully automatic, sends inside Thumbtack)
-    // Method B: Email thread reply (works for Yelp, sometimes Thumbtack)
-    // Method C: SMS draft to owner (always works as fallback)
-    console.log('[Server] Step 5: Sending reply...');
+    // Send reply INSIDE Thumbtack via official API
+    await sendMessage(client, negotiationId, aiReply);
+    console.log('[Lead] ✅ Reply sent inside Thumbtack');
 
-    let replySent = false;
-
-    // METHOD A: Thumbtack browser automation
-    // Only runs if the client has Thumbtack credentials stored
-    // and the lead came from Thumbtack with a direct URL
-    if (
-      lead.source === 'thumbtack' &&
-      lead.directLeadUrl &&
-      client.thumbtackUsername &&
-      client.thumbtackPassword
-    ) {
-      console.log('[Server] Attempting Thumbtack browser automation...');
-      replySent = await sendThumbtackReply(
-        lead.directLeadUrl,
-        aiReply,
-        client.thumbtackUsername,
-        client.thumbtackPassword
-      );
-
-      if (replySent) {
-        console.log('[Server] ✅ Reply sent via Thumbtack automation');
-      } else {
-        console.log('[Server] Thumbtack automation failed — trying email fallback');
-      }
-    }
-
-    // METHOD B: Email thread reply
-    // Works when we have the reply-to address from the notification email
-    if (!replySent && email.replyTo) {
-      console.log('[Server] Attempting email thread reply...');
-      const { sendEmailReply } = require('./email-sender');
-      replySent = await sendEmailReply(email, aiReply, client);
-
-      if (replySent) {
-        console.log('[Server] ✅ Reply sent via email thread');
-      } else {
-        console.log('[Server] Email reply failed — using SMS fallback');
-      }
-    }
-
-    // METHOD C: SMS draft to owner (always works)
-    if (!replySent) {
-      console.log('[Server] Sending SMS draft to owner as fallback...');
-      if (client.ownerPhone && client.twilioNumber) {
-        await sendOwnerDraftReply(
-          client.ownerPhone,
-          lead,
-          aiReply,
-          lead.directLeadUrl,
-          client.twilioNumber
-        );
-        console.log('[Server] ✅ Draft sent to owner via SMS');
-        replySent = true; // Owner can paste it manually
-      }
-    }
-
-    // ---- STEP 6: NOTIFY THE OWNER ----
-    // Always notify the owner so they know what's happening
-    if (client.ownerPhone && client.twilioNumber) {
-      console.log('[Server] Step 6: Notifying owner...');
+    // Notify owner by SMS
+    if (client.ownerPhone) {
       await notifyOwner(
         client.ownerPhone,
         lead,
         aiReply,
-        lead.directLeadUrl
+        `https://www.thumbtack.com/pro/messages/${negotiationId}`
       );
     }
 
-    // ---- STEP 7: LOG TO AIRTABLE ----
-    console.log('[Server] Step 7: Logging to Airtable...');
-    const recordId = await saveLead(lead, client, aiReply, leadScore);
+    // Save to Airtable
+    await saveLead(lead, client, aiReply);
+  }
 
-    console.log(`\n[Server] ✅ Lead processed successfully!`);
-    console.log(`[Server] Lead: ${lead.leadName} | Score: ${leadScore}/10 | Reply sent: ${replySent}`);
-    console.log('========================================\n');
+  // ── PHONE NUMBER UNLOCKED ─────────────────
+  // Thumbtack sends this after the first reply is sent
+  if (data.eventType === 'lead.updated') {
+    const phone = data.lead?.customerPhone || data.customerPhone;
+    const negotiationId = data.negotiationId || data.lead?.negotiationId;
 
-  } catch (error) {
-    console.error('[Server] ❌ Error in processNewLead:', error);
+    if (phone && negotiationId) {
+      console.log(`[Lead] Phone unlocked: ${phone}`);
+
+      // Load client and find their lead record
+      const client = await getClientById(clientId);
+      if (!client) return;
+
+      // Send a direct text from the client's Quo number
+      const followUpText =
+        `Hi, this is ${client.ownerName} from ${client.businessName} — ` +
+        `just replied to your Thumbtack message! Feel free to text or call us ` +
+        `here directly too. ${client.calendlyLink ? `Book a time here: ${client.calendlyLink}` : ''}`.trim();
+
+      await textLead(phone, followUpText, client.quoPhoneId);
+      console.log('[Lead] ✅ Follow-up text sent via Quo');
+
+      // Update the lead record with the phone number
+      // Find the lead by negotiation ID
+      try {
+        const Airtable = require('airtable');
+        const base = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(process.env.AIRTABLE_BASE_ID);
+        const records = await base('Leads').select({
+          filterByFormula: `{Negotiation ID} = "${negotiationId}"`,
+          maxRecords: 1
+        }).firstPage();
+
+        if (records.length) {
+          await updateLead(records[0].id, { 'Lead Phone': phone, 'Status': 'Qualified' });
+        }
+      } catch (e) {
+        console.error('[Lead] Could not update phone in Airtable:', e.message);
+      }
+    }
   }
 }
 
-// ============================================
+// ─────────────────────────────────────────────
 // TEST ENDPOINT
-// Use this to test your setup without
-// needing a real lead email
-//
-// Send a POST request to /test with:
-// { "clientName": "Your Client Name" }
-// ============================================
+// POST /test with header x-webhook-secret to
+// run a fake lead through the full system
+// ─────────────────────────────────────────────
 app.post('/test', async (req, res) => {
-  console.log('[Server] Running test with fake lead data...');
-
-  const secret = req.headers['x-webhook-secret'];
-  if (secret !== process.env.WEBHOOK_SECRET) {
+  if (req.headers['x-webhook-secret'] !== process.env.WEBHOOK_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  // Fake lead data that mimics a real Thumbtack notification
-  const testWebhookData = {
-    clientName: req.body.clientName || 'Test Client',
-    email: {
-      from: 'noreply@thumbtack.com',
-      replyTo: 'reply-test123@mail.thumbtack.com',
-      subject: 'New lead: Local Moving (under 50 miles)',
-      messageId: '<test123@thumbtack.com>',
-      text: `Nicole W.
-Direct lead
+  const clientName = req.body.clientName || 'Test Client';
+  res.json({ message: 'Test running — check server logs' });
 
-Local Moving (under 50 miles)
+  const client = await getClientByName(clientName).catch(() => null);
+  if (!client) return console.log('[Test] Client not found:', clientName);
 
-Brandon, FL 33511
-Dates: May 12, 15
-Open to other dates you suggest
-You can call this customer after you reply.
-
-Move distance: 11 - 20 miles
-Loading: Load flat; no stairs or elevator
-Move size: 3 bedroom home
-Move type: Movers only
-Unloading: Unload flat; no stairs or elevator
-Travel preferences: Professionals may travel to my address
-
-View direct lead: https://www.thumbtack.com/pro/leads/test-lead-123`
-    }
+  const fakeLead = {
+    source: 'thumbtack',
+    leadName: 'Nicole W.',
+    serviceType: 'Local Moving (under 50 miles)',
+    location: 'Brandon, FL 33511',
+    dates: 'May 12, 15',
+    jobDetails: {
+      'Move distance': '11-20 miles',
+      'Move size': '3 bedroom home',
+      'Loading': 'Flat, no stairs',
+      'Unloading': 'Flat, no stairs'
+    },
+    message: 'Looking for movers available around May 12.',
+    negotiationId: 'test-' + Date.now(),
+    phone: ''
   };
 
-  res.json({ message: 'Test started — check server logs for output' });
-
-  await processNewLead(testWebhookData).catch(console.error);
+  const aiReply = await generateFirstReply(fakeLead, client);
+  console.log('\n[Test] ✅ AI reply generated:');
+  console.log(aiReply);
+  console.log('\n[Test] Lead would be saved to Airtable and owner notified.');
 });
 
-// ============================================
-// TEST THUMBTACK LOGIN
-// Call this to verify a client's Thumbtack
-// credentials are correct before going live
-//
-// POST /test-login
-// { "username": "email@example.com", "password": "their-password" }
-// ============================================
-app.post('/test-login', async (req, res) => {
-  const secret = req.headers['x-webhook-secret'];
-  if (secret !== process.env.WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  const { username, password } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password required' });
-  }
-
-  const success = await testThumbtackLogin(username, password);
-  res.json({
-    success,
-    message: success
-      ? 'Login works! Thumbtack automation is ready.'
-      : 'Login failed. Check the username and password.'
-  });
-});
-
-// ============================================
+// ─────────────────────────────────────────────
 // FOLLOW-UP SCHEDULER
-// Runs every hour and checks for leads that
-// need a follow-up message sent.
-// After 24 hours with no response → follow-up 1
-// After 48 hours → follow-up 2
-// After 72 hours → final follow-up
-// ============================================
+// Runs every hour — sends follow-ups to leads
+// that haven't responded after 24/48/72 hours
+// ─────────────────────────────────────────────
 cron.schedule('0 * * * *', async () => {
-  console.log('[Scheduler] Checking for leads needing follow-up...');
+  console.log('[Cron] Checking for follow-ups...');
+  const leads = await getLeadsNeedingFollowUp().catch(() => []);
 
-  try {
-    const leadsToFollowUp = await getLeadsNeedingFollowUp();
+  for (const lead of leads) {
+    const client = await getClientByName(lead.clientName).catch(() => null);
+    if (!client || !client.isActive) continue;
 
-    for (const lead of leadsToFollowUp) {
-      const client = await getClientByName(lead.clientName);
-      if (!client || !client.isActive) continue;
+    const followUpNum = (lead.followUpCount || 0) + 1;
+    const message = await generateFollowUp(lead, client, followUpNum);
 
-      const followUpNumber = (lead.followUpCount || 0) + 1;
-      const message = await generateFollowUp(lead, client, followUpNumber);
-
-      // Send follow-up via SMS if we have their number
-      if (lead.leadPhone && client.twilioNumber) {
-        const { sendLeadSMS } = require('./twilio');
-        await sendLeadSMS(lead.leadPhone, message, client.twilioNumber);
-      }
-
-      // Update the follow-up count in Airtable
-      await updateLeadStatus(lead.id, 'Contacted',
-        `Follow-up #${followUpNumber} sent on ${new Date().toLocaleString()}`
-      );
-
-      console.log(`[Scheduler] Follow-up #${followUpNumber} sent for lead: ${lead.leadName}`);
+    if (lead.leadPhone && client.quoPhoneId) {
+      await textLead(lead.leadPhone, message, client.quoPhoneId);
+      await updateLead(lead.id, {
+        'Follow Up Count': followUpNum,
+        'Notes': `Follow-up #${followUpNum} sent ${new Date().toLocaleString()}`
+      });
+      console.log(`[Cron] Follow-up #${followUpNum} sent to ${lead.leadName}`);
     }
-
-  } catch (error) {
-    console.error('[Scheduler] Error in follow-up cron:', error);
   }
 });
 
-// ============================================
-// START THE SERVER
-// ============================================
+// ─────────────────────────────────────────────
+// START
+// ─────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('\n========================================');
-  console.log(`🚀 LeadFlow server running on port ${PORT}`);
-  console.log(`📡 Webhook URL: http://yourdomain.com/webhook/new-lead`);
-  console.log(`🏥 Health check: http://yourdomain.com/health`);
-  console.log('========================================\n');
+  console.log(`\n========================================`);
+  console.log(`🚀 LeadFlow running on port ${PORT}`);
+  console.log(`🌐 ${APP_URL}`);
+  console.log(`\nURLs for Thumbtack application:`);
+  console.log(`  Homepage:  ${APP_URL}`);
+  console.log(`  OAuth:     ${APP_URL}/auth/thumbtack/callback`);
+  console.log(`  Webhook:   ${APP_URL}/webhook/thumbtack/:clientId`);
+  console.log(`========================================\n`);
 });
 
 module.exports = app;
